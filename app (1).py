@@ -4,7 +4,7 @@ Frontera Eficiente de Markowitz + CML
 App de Streamlit que:
   * Descarga precios (Yahoo Finance) o lee un CSV propio.
   * Calcula retornos ANUALES (precio de cierre de cada año) o anualizados desde diarios.
-  * Construye la frontera eficiente (sin ventas en corto).
+  * Construye la frontera eficiente (sin ventas en corto, con peso mínimo por activo configurable).
   * Dibuja la Capital Market Line (CML).
   * Marca 3 portafolios: Mínima Varianza, Máximo Retorno y Máximo Sharpe (tangente).
 
@@ -67,24 +67,24 @@ def stats_portafolio(w, mu, cov, rf):
     return r, s, sharpe
 
 
-def _base(n):
+def _base(n, w_min=0.0):
     w0 = np.repeat(1 / n, n)
-    bounds = tuple((0.0, 1.0) for _ in range(n))
+    bounds = tuple((w_min, 1.0) for _ in range(n))
     suma_1 = {"type": "eq", "fun": lambda w: np.sum(w) - 1}
     return w0, bounds, suma_1
 
 
-def min_varianza(mu, cov):
+def min_varianza(mu, cov, w_min=0.0):
     n = len(mu)
-    w0, bounds, suma_1 = _base(n)
+    w0, bounds, suma_1 = _base(n, w_min)
     res = minimize(lambda w: w @ cov @ w, w0, method="SLSQP",
                    bounds=bounds, constraints=[suma_1])
     return res.x
 
 
-def max_sharpe(mu, cov, rf):
+def max_sharpe(mu, cov, rf, w_min=0.0):
     n = len(mu)
-    w0, bounds, suma_1 = _base(n)
+    w0, bounds, suma_1 = _base(n, w_min)
 
     def neg_sharpe(w):
         r = w @ mu
@@ -96,18 +96,18 @@ def max_sharpe(mu, cov, rf):
     return res.x
 
 
-def max_retorno(mu, cov):
-    # Sin ventas en corto el máximo retorno es 100% en el activo de mayor retorno.
-    # Se resuelve igual con el optimizador, minimizando varianza ante empates.
+def max_retorno(mu, cov, w_min=0.0):
+    # Cada activo recibe el mínimo exigido y todo el resto va al activo
+    # de mayor retorno esperado (solución exacta de este problema lineal).
     n = len(mu)
-    w = np.zeros(n)
-    w[int(np.argmax(mu))] = 1.0
+    w = np.repeat(w_min, n)
+    w[int(np.argmax(mu))] += 1.0 - n * w_min
     return w
 
 
-def frontera_eficiente(mu, cov, r_min, r_max, puntos=60):
+def frontera_eficiente(mu, cov, r_min, r_max, w_min=0.0, puntos=60):
     n = len(mu)
-    w0, bounds, suma_1 = _base(n)
+    w0, bounds, suma_1 = _base(n, w_min)
     rets_obj = np.linspace(r_min, r_max, puntos)
     vols, rets_ok = [], []
     for r_obj in rets_obj:
@@ -121,9 +121,10 @@ def frontera_eficiente(mu, cov, r_min, r_max, puntos=60):
     return np.array(vols), np.array(rets_ok)
 
 
-def portafolios_aleatorios(mu, cov, rf, n_port=3000, seed=42):
+def portafolios_aleatorios(mu, cov, rf, w_min=0.0, n_port=3000, seed=42):
     rng = np.random.default_rng(seed)
-    W = rng.dirichlet(np.ones(len(mu)), n_port)
+    n = len(mu)
+    W = w_min + (1 - n * w_min) * rng.dirichlet(np.ones(n), n_port)
     r = W @ mu
     s = np.sqrt(np.einsum("ij,jk,ik->i", W, cov, W))
     return r, s, (r - rf) / s
@@ -153,6 +154,10 @@ with st.sidebar:
                           ["Anuales (cierre de cada año)",
                            "Anualizados desde diarios"])
     rf = st.number_input("Tasa libre de riesgo anual (%)", 0.0, 50.0, 4.0, 0.25) / 100
+    w_min = st.number_input(
+        "Peso mínimo por activo (%)", 0.0, 50.0, 5.0, 0.5,
+        help="Cada activo tendrá al menos este porcentaje en todos los portafolios. "
+             "0% = el modelo puede excluir activos.") / 100
     mostrar_mc = st.checkbox("Mostrar portafolios aleatorios", True)
     calcular = st.button("Calcular", type="primary", use_container_width=True)
 
@@ -194,17 +199,30 @@ if metodo.startswith("Anuales") and len(rets) <= len(mu):
 activos = list(mu.index)
 mu_v, cov_v = mu.values, cov.values
 
+n_act = len(activos)
+if n_act * w_min > 1 + 1e-9:
+    st.error(f"Con {n_act} activos el peso mínimo no puede superar "
+             f"{100 / n_act:.2f}% (si no, la suma pasa del 100%). "
+             f"Ingresaste {w_min:.2%}.")
+    st.stop()
+if abs(n_act * w_min - 1) < 1e-9:
+    st.warning("Con ese mínimo el único portafolio posible es el equiponderado.")
+st.caption(f"Peso mínimo por activo: **{w_min:.2%}** · "
+           f"Peso máximo posible en un activo: **{1 - (n_act - 1) * w_min:.2%}**")
+
 # --- Portafolios clave
-w_mv = min_varianza(mu_v, cov_v)
-w_ms = max_sharpe(mu_v, cov_v, rf)
-w_mr = max_retorno(mu_v, cov_v)
+w_mv = min_varianza(mu_v, cov_v, w_min)
+w_ms = max_sharpe(mu_v, cov_v, rf, w_min)
+w_mr = max_retorno(mu_v, cov_v, w_min)
 
 r_mv, s_mv, sh_mv = stats_portafolio(w_mv, mu_v, cov_v, rf)
 r_ms, s_ms, sh_ms = stats_portafolio(w_ms, mu_v, cov_v, rf)
 r_mr, s_mr, sh_mr = stats_portafolio(w_mr, mu_v, cov_v, rf)
 
 # --- Frontera y CML
-vols_f, rets_f = frontera_eficiente(mu_v, cov_v, r_mv, mu_v.max())
+vols_f, rets_f = frontera_eficiente(mu_v, cov_v, r_mv, r_mr, w_min)
+if len(vols_f) == 0:  # caso equiponderado forzado
+    vols_f, rets_f = np.array([s_mv]), np.array([r_mv])
 s_max = max(vols_f.max(), np.sqrt(np.diag(cov_v)).max()) * 1.15
 x_cml = np.linspace(0, s_max, 100)
 y_cml = rf + sh_ms * x_cml
@@ -213,7 +231,7 @@ y_cml = rf + sh_ms * x_cml
 fig = go.Figure()
 
 if mostrar_mc:
-    r_mc, s_mc, sh_mc = portafolios_aleatorios(mu_v, cov_v, rf)
+    r_mc, s_mc, sh_mc = portafolios_aleatorios(mu_v, cov_v, rf, w_min)
     fig.add_trace(go.Scatter(
         x=s_mc, y=r_mc, mode="markers", name="Portafolios aleatorios",
         marker=dict(size=4, color=sh_mc, colorscale="Viridis", opacity=0.45,
@@ -286,7 +304,7 @@ pesos = pd.DataFrame({
     "Máximo Sharpe": w_ms,
     "Máximo Retorno": w_mr,
 }, index=activos)
-pesos[pesos.abs() < 1e-4] = 0.0
+pesos = pesos.clip(lower=w_min).div(pesos.clip(lower=w_min).sum(), axis=1)
 
 fig_w = go.Figure()
 for col, color in zip(pesos.columns, ["#2ca02c", "#ff7f0e", "#9467bd"]):
